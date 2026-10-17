@@ -1,9 +1,11 @@
 require("dotenv").config();
 
+const fs = require("node:fs");
+const path = require("node:path");
+
 const {
   Client,
   GatewayIntentBits,
-  Partials,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -15,525 +17,556 @@ const {
   TextInputBuilder,
   TextInputStyle,
   StringSelectMenuBuilder,
-  PermissionFlagsBits,
+  PermissionFlagsBits
 } = require("discord.js");
 
 const Database = require("better-sqlite3");
-const fs = require("node:fs");
-const path = require("node:path");
 
 // ==================================================
 // SICOR — SISTEMA INTEGRADO DE CORREGEDORIA
-// Polícia Civil | Sistema de atendimento e processos
+// POLÍCIA CIVIL | REDUTO ONLINE
 // ==================================================
 
-const REQUIRED_ENV = [
-  "DISCORD_TOKEN",
-  "CLIENT_ID",
-  "GUILD_ID",
-  "INTERNAL_CHANNEL_ID",
-  "CORREGEDOR_ROLE_ID",
-  "ALTO_COMANDO_ROLE_ID",
-];
+// CONFIGURAÇÕES DA APLICAÇÃO
 
-const missingEnv = REQUIRED_ENV.filter(
-  (key) => !process.env[key]
-);
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
-if (missingEnv.length > 0) {
+const CLIENT_ID = "1561124070907711528";
+const GUILD_ID = "1540152016486011003";
+const INTERNAL_CHANNEL_ID = "1548107581518516254";
+
+const CORREGEDOR_ROLE_ID = "1547390225607692419";
+const ALTO_COMANDO_ROLE_ID = "1540171391704498196";
+
+// VERIFICAÇÃO DO TOKEN
+
+if (!DISCORD_TOKEN) {
   console.error(
-    `[SICOR] Variáveis ausentes: ${missingEnv.join(", ")}`
+    "[SICOR] ERRO: configure a variável DISCORD_TOKEN na hospedagem."
   );
   process.exit(1);
 }
 
-const {
-  DISCORD_TOKEN,
-  CLIENT_ID,
-  GUILD_ID,
-  INTERNAL_CHANNEL_ID,
-  CORREGEDOR_ROLE_ID,
-  ALTO_COMANDO_ROLE_ID,
-} = process.env;
+// ==================================================
+// CLIENTE DO DISCORD
+// ==================================================
 
-// Banco de dados na pasta do próprio projeto
-const dataDir = path.join(__dirname, "data");
-
-fs.mkdirSync(dataDir, { recursive: true });
-
-const db = new Database(
-  path.join(dataDir, "sicor.sqlite")
-);
-
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
 
 // ==================================================
 // BANCO DE DADOS
 // ==================================================
 
+const dataDir = path.join(__dirname, "data");
+
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+const db = new Database(path.join(dataDir, "sicor.sqlite"));
+
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS cases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    protocol TEXT UNIQUE NOT NULL,
+    protocol TEXT UNIQUE,
     type TEXT NOT NULL,
-    requester_id TEXT NOT NULL,
-    requester_tag TEXT NOT NULL,
     subject TEXT NOT NULL,
+    involved TEXT NOT NULL,
     description TEXT NOT NULL,
-    unit TEXT DEFAULT '',
-    occurred_at TEXT DEFAULT '',
-    evidence TEXT DEFAULT '',
+    evidence TEXT,
+    author_id TEXT NOT NULL,
+    author_tag TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'Recebido',
-    decision TEXT DEFAULT '',
-    assigned_to TEXT DEFAULT '',
-    internal_message_id TEXT DEFAULT '',
+    assigned_to TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    protocol TEXT NOT NULL,
+    case_id INTEGER NOT NULL,
     actor_id TEXT NOT NULL,
     actor_tag TEXT NOT NULL,
     action TEXT NOT NULL,
-    details TEXT DEFAULT '',
+    details TEXT,
     created_at TEXT NOT NULL,
-    FOREIGN KEY (protocol)
-      REFERENCES cases(protocol)
-      ON DELETE CASCADE
+    FOREIGN KEY(case_id) REFERENCES cases(id)
   );
 `);
 
-const insertEvent = db.prepare(`
-  INSERT INTO events (
-    protocol,
-    actor_id,
-    actor_tag,
-    action,
-    details,
-    created_at
-  )
-  VALUES (?, ?, ?, ?, ?, ?)
-`);
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
 
-const getCase = db.prepare(`
-  SELECT * FROM cases
-  WHERE protocol = ?
-`);
+  if (!columns.some((item) => item.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
 
-const getUserCases = db.prepare(`
-  SELECT * FROM cases
-  WHERE requester_id = ?
-  ORDER BY id DESC
-  LIMIT 10
-`);
-
-const getRecentCases = db.prepare(`
-  SELECT * FROM cases
-  ORDER BY id DESC
-  LIMIT 10
-`);
-
-const getEvents = db.prepare(`
-  SELECT * FROM events
-  WHERE protocol = ?
-  ORDER BY id DESC
-  LIMIT 20
-`);
-
-const updateStatus = db.prepare(`
-  UPDATE cases
-  SET status = ?, updated_at = ?
-  WHERE protocol = ?
-`);
-
-const updateDecision = db.prepare(`
-  UPDATE cases
-  SET decision = ?, updated_at = ?
-  WHERE protocol = ?
-`);
-
-const updateAssignee = db.prepare(`
-  UPDATE cases
-  SET assigned_to = ?, updated_at = ?
-  WHERE protocol = ?
-`);
-
-const updateEvidence = db.prepare(`
-  UPDATE cases
-  SET evidence = ?, updated_at = ?
-  WHERE protocol = ?
-`);
+ensureColumn("cases", "involved", "TEXT NOT NULL DEFAULT 'Não informado'");
+ensureColumn("cases", "evidence", "TEXT");
+ensureColumn("cases", "assigned_to", "TEXT");
 
 // ==================================================
-// CLIENTE DISCORD
+// CONSTANTES E FUNÇÕES AUXILIARES
 // ==================================================
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-  partials: [Partials.Channel],
-});
+const COLORS = {
+  black: 0x111111,
+  white: 0xFFFFFF,
+  gold: 0xC9A227,
+  red: 0xB22222,
+  green: 0x228B22,
+  gray: 0x555555
+};
 
-const STATUS_OPTIONS = [
-  {
-    label: "Recebido",
-    value: "Recebido",
-    description: "Solicitação recebida",
-  },
-  {
-    label: "Em análise",
-    value: "Em análise",
-    description: "Processo em análise",
-  },
-  {
-    label: "Aguardando informações",
-    value: "Aguardando informações",
-    description: "Aguardando informações adicionais",
-  },
-  {
-    label: "Concluído",
-    value: "Concluído",
-    description: "Processo concluído",
-  },
-  {
-    label: "Arquivado",
-    value: "Arquivado",
-    description: "Processo arquivado",
-  },
+const CASE_TYPES = {
+  denuncia: "Denúncia",
+  recurso: "Recurso de punição",
+  duvida: "Dúvida",
+  evidencia: "Envio de evidências",
+  acompanhamento: "Acompanhamento de processo"
+};
+
+const STATUSES = [
+  { label: "Recebido", value: "Recebido" },
+  { label: "Em análise", value: "Em análise" },
+  { label: "Em diligência", value: "Em diligência" },
+  { label: "Concluído", value: "Concluído" },
+  { label: "Arquivado", value: "Arquivado" },
+  { label: "Indeferido", value: "Indeferido" }
 ];
 
-// ==================================================
-// FUNÇÕES AUXILIARES
-// ==================================================
-
-function nowIso() {
+function now() {
   return new Date().toISOString();
 }
 
-function dateLabel(value) {
-  const timestamp = Date.parse(value);
+function formatDate(date) {
+  if (!date) return "Não informado";
 
-  if (Number.isNaN(timestamp)) {
-    return "Data indisponível";
-  }
-
-  return `<t:${Math.floor(timestamp / 1000)}:F>`;
+  return new Date(date).toLocaleString("pt-BR", {
+    timeZone: "America/Sao_Paulo"
+  });
 }
 
-function safeText(value, fallback = "Não informado") {
+function clip(value, max = 1000) {
   const text = String(value ?? "").trim();
 
-  return text ? text.slice(0, 1024) : fallback;
+  return text.length <= max
+    ? text
+    : text.slice(0, max - 3) + "...";
+}
+
+function getText(interaction, field) {
+  try {
+    return interaction.fields.getTextInputValue(field).trim();
+  } catch {
+    return "";
+  }
+}
+
+function getMemberRoleIds(member) {
+  if (!member) return [];
+
+  if (member.roles?.cache) {
+    return [...member.roles.cache.keys()];
+  }
+
+  if (Array.isArray(member.roles)) {
+    return member.roles;
+  }
+
+  return [];
 }
 
 function hasStaffRole(member) {
-  if (!member?.roles?.cache) {
-    return false;
-  }
+  const roles = getMemberRoleIds(member);
 
   return (
-    member.roles.cache.has(CORREGEDOR_ROLE_ID) ||
-    member.roles.cache.has(ALTO_COMANDO_ROLE_ID)
+    roles.includes(CORREGEDOR_ROLE_ID) ||
+    roles.includes(ALTO_COMANDO_ROLE_ID)
   );
 }
 
-function canAccessCase(interaction, record) {
-  if (!record) {
-    return false;
-  }
-
-  return (
-    record.requester_id === interaction.user.id ||
-    hasStaffRole(interaction.member)
-  );
+function staffOnly(interaction) {
+  return hasStaffRole(interaction.member);
 }
 
-function addEvent(protocol, user, action, details = "") {
-  insertEvent.run(
-    protocol,
-    user.id,
-    user.tag ?? user.username,
+function makeEmbed(title, description, color = COLORS.gold) {
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setDescription(description)
+    .setFooter({
+      text: "SICOR • Polícia Civil • Reduto Online"
+    })
+    .setTimestamp();
+}
+
+function getCaseByProtocol(protocol) {
+  return db.prepare(
+    "SELECT * FROM cases WHERE protocol = ?"
+  ).get(String(protocol).trim().toUpperCase());
+}
+
+function getCaseById(id) {
+  return db.prepare(
+    "SELECT * FROM cases WHERE id = ?"
+  ).get(Number(id));
+}
+
+function createProtocol() {
+  const year = new Date().getFullYear();
+
+  const row = db.prepare(`
+    SELECT COUNT(*) AS total
+    FROM cases
+    WHERE protocol LIKE ?
+  `).get(`SICOR-${year}-%`);
+
+  let sequence = Number(row.total) + 1;
+
+  while (true) {
+    const protocol = `SICOR-${year}-${String(sequence).padStart(4, "0")}`;
+
+    const exists = db.prepare(
+      "SELECT id FROM cases WHERE protocol = ?"
+    ).get(protocol);
+
+    if (!exists) return protocol;
+
+    sequence++;
+  }
+}
+
+function logEvent(caseId, interaction, action, details = "") {
+  db.prepare(`
+    INSERT INTO events (
+      case_id,
+      actor_id,
+      actor_tag,
+      action,
+      details,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    caseId,
+    interaction.user.id,
+    interaction.user.tag,
     action,
-    String(details).slice(0, 1000),
-    nowIso()
+    clip(details, 1000),
+    now()
   );
 }
+
+function updateCaseStatus(caseId, status, interaction) {
+  const record = getCaseById(caseId);
+
+  if (!record) return false;
+
+  db.prepare(`
+    UPDATE cases
+    SET status = ?, updated_at = ?
+    WHERE id = ?
+  `).run(status, now(), caseId);
+
+  logEvent(
+    caseId,
+    interaction,
+    "Alteração de status",
+    `${record.status} → ${status}`
+  );
+
+  return true;
+}
+
+// ==================================================
+// EMBED DO PROCESSO
+// ==================================================
 
 function caseEmbed(record) {
   return new EmbedBuilder()
-    .setColor(
-      record.status === "Concluído"
-        ? 0x2ecc71
-        : record.status === "Arquivado"
-          ? 0x7f8c8d
-          : 0xc9a227
-    )
-    .setTitle(`⚖️ SICOR | ${record.protocol}`)
+    .setColor(COLORS.gold)
+    .setTitle("⚖️ SICOR | Processo da Corregedoria")
     .setDescription(
-      `**Tipo:** ${safeText(record.type)}\n` +
-      `**Assunto:** ${safeText(record.subject)}\n` +
-      `**Descrição:** ${safeText(record.description)}`
+      `**Protocolo:** \`${record.protocol}\`\n` +
+      `**Tipo:** ${record.type}\n` +
+      `**Status:** ${record.status}`
     )
     .addFields(
       {
-        name: "Solicitante",
-        value: `<@${record.requester_id}>`,
-        inline: true,
+        name: "Assunto",
+        value: clip(record.subject, 1024) || "Não informado"
       },
       {
-        name: "Status",
-        value: safeText(record.status),
-        inline: true,
+        name: "Envolvido(s)",
+        value: clip(record.involved, 1024) || "Não informado"
       },
       {
-        name: "Unidade/Corporação",
-        value: safeText(record.unit),
-        inline: true,
+        name: "Relato",
+        value: clip(record.description, 1024) || "Não informado"
       },
       {
-        name: "Data do ocorrido",
-        value: safeText(record.occurred_at),
-        inline: true,
+        name: "Evidências",
+        value: clip(record.evidence || "Nenhuma evidência informada.", 1024)
+      },
+      {
+        name: "Requerente",
+        value: `<@${record.author_id}>`,
+        inline: true
       },
       {
         name: "Responsável",
         value: record.assigned_to
           ? `<@${record.assigned_to}>`
-          : "Não atribuído",
-        inline: true,
+          : "Não designado",
+        inline: true
       },
       {
-        name: "Despacho/Decisão",
-        value: safeText(record.decision),
-        inline: false,
-      },
-      {
-        name: "Evidências",
-        value: safeText(record.evidence),
-        inline: false,
-      },
-      {
-        name: "Criado em",
-        value: dateLabel(record.created_at),
-        inline: true,
-      },
-      {
-        name: "Última atualização",
-        value: dateLabel(record.updated_at),
-        inline: true,
+        name: "Abertura",
+        value: formatDate(record.created_at),
+        inline: true
       }
     )
     .setFooter({
-      text: "SICOR • Sistema Integrado de Corregedoria",
-    });
+      text: "SICOR • Polícia Civil • Reduto Online"
+    })
+    .setTimestamp(new Date(record.updated_at));
 }
 
-function staffButtons(protocol) {
-  return new ActionRowBuilder().addComponents(
+// ==================================================
+// CONTROLES INTERNOS
+// ==================================================
+
+function staffComponents(caseId) {
+  const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`sicor:staff:status:${protocol}`)
-      .setLabel("Alterar status")
+      .setCustomId(`sicor:assumir:${caseId}`)
+      .setLabel("Assumir processo")
       .setStyle(ButtonStyle.Primary),
 
     new ButtonBuilder()
-      .setCustomId(`sicor:staff:decision:${protocol}`)
+      .setCustomId(`sicor:despacho:${caseId}`)
       .setLabel("Registrar despacho")
       .setStyle(ButtonStyle.Secondary),
 
     new ButtonBuilder()
-      .setCustomId(`sicor:staff:assign:${protocol}`)
-      .setLabel("Assumir processo")
-      .setStyle(ButtonStyle.Success),
-
-    new ButtonBuilder()
-      .setCustomId(`sicor:staff:evidence:${protocol}`)
-      .setLabel("Adicionar evidência")
+      .setCustomId(`sicor:evidencias:${caseId}`)
+      .setLabel("Adicionar evidências")
       .setStyle(ButtonStyle.Secondary),
 
     new ButtonBuilder()
-      .setCustomId(`sicor:staff:history:${protocol}`)
+      .setCustomId(`sicor:historico:${caseId}`)
       .setLabel("Histórico")
-      .setStyle(ButtonStyle.Secondary)
+      .setStyle(ButtonStyle.Success)
   );
+
+  const statusRow = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`sicor:status:${caseId}`)
+      .setPlaceholder("Alterar status do processo")
+      .addOptions(
+        STATUSES.map((status) => ({
+          label: status.label,
+          value: status.value
+        }))
+      )
+  );
+
+  return [actionRow, statusRow];
 }
 
 // ==================================================
-// PAINEL PÚBLICO
+// PAINEL OFICIAL DA POLÍCIA CIVIL DO REDUTO
 // ==================================================
 
 function publicPanelEmbed() {
   return new EmbedBuilder()
-    .setColor(0xc9a227)
-    .setTitle("⚖️ SICOR — Corregedoria da Polícia Civil")
+    .setColor(COLORS.black)
+    .setTitle("⚖️ SICOR — Sistema Integrado de Corregedoria")
     .setDescription(
-      "Bem-vindo à Central de Atendimento da Corregedoria.\n\n" +
-      "Utilize os botões abaixo para registrar uma solicitação " +
-      "ou acompanhar um processo administrativo.\n\n" +
-      "📋 **Registrar denúncia:** comunique irregularidades.\n" +
-      "⚖️ **Recorrer de punição:** solicite a revisão de uma punição.\n" +
-      "❓ **Retirar dúvidas:** encaminhe dúvidas à Corregedoria.\n" +
-      "📎 **Enviar evidências:** registre informações e evidências.\n" +
-      "🔎 **Acompanhar processo:** consulte seu protocolo.\n\n" +
-      "🔒 As solicitações serão encaminhadas à equipe autorizada."
+      "**POLÍCIA CIVIL | REDUTO ONLINE**\n\n" +
+      "Bem-vindo ao canal oficial de atendimento da Corregedoria da Polícia Civil do Reduto.\n\n" +
+      "Utilize os botões abaixo para registrar sua solicitação.\n\n" +
+      "📁 **Registrar denúncia:** comunicar possíveis irregularidades.\n" +
+      "⚖️ **Recorrer de punição:** solicitar reavaliação de uma medida.\n" +
+      "❔ **Retirar dúvidas:** encaminhar questionamentos à Corregedoria.\n" +
+      "📎 **Enviar evidências:** apresentar informações relevantes.\n" +
+      "🔎 **Acompanhar processo:** consultar um processo registrado.\n\n" +
+      "🔒 As informações serão tratadas de forma restrita pela equipe autorizada."
     )
+    .addFields({
+      name: "Orientações",
+      value:
+        "Apresente informações verdadeiras, claras e objetivas. " +
+        "O registro de uma solicitação não garante seu deferimento."
+    })
     .setFooter({
-      text: "SICOR • Sistema Integrado de Corregedoria",
-    });
+      text: "SICOR • Polícia Civil • Reduto Online"
+    })
+    .setTimestamp();
 }
 
-function publicPanelRows() {
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("sicor:new:Denúncia")
-      .setLabel("Registrar denúncia")
-      .setStyle(ButtonStyle.Danger),
+function publicPanelButtons() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("sicor:new:denuncia")
+        .setLabel("Registrar denúncia")
+        .setEmoji("📁")
+        .setStyle(ButtonStyle.Danger),
 
-    new ButtonBuilder()
-      .setCustomId("sicor:new:Recurso de punição")
-      .setLabel("Recorrer de punição")
-      .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("sicor:new:recurso")
+        .setLabel("Recorrer de punição")
+        .setEmoji("⚖️")
+        .setStyle(ButtonStyle.Primary),
 
-    new ButtonBuilder()
-      .setCustomId("sicor:new:Dúvida")
-      .setLabel("Retirar dúvidas")
-      .setStyle(ButtonStyle.Secondary)
-  );
+      new ButtonBuilder()
+        .setCustomId("sicor:new:duvida")
+        .setLabel("Retirar dúvidas")
+        .setEmoji("❔")
+        .setStyle(ButtonStyle.Secondary)
+    ),
 
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("sicor:new:Envio de evidências")
-      .setLabel("Enviar evidências")
-      .setStyle(ButtonStyle.Secondary),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("sicor:new:evidencia")
+        .setLabel("Enviar evidências")
+        .setEmoji("📎")
+        .setStyle(ButtonStyle.Secondary),
 
-    new ButtonBuilder()
-      .setCustomId("sicor:track")
-      .setLabel("Acompanhar processo")
-      .setStyle(ButtonStyle.Success)
-  );
-
-  return [row1, row2];
+      new ButtonBuilder()
+        .setCustomId("sicor:new:acompanhamento")
+        .setLabel("Acompanhar processo")
+        .setEmoji("🔎")
+        .setStyle(ButtonStyle.Success)
+    )
+  ];
 }
 
 // ==================================================
 // FORMULÁRIOS
 // ==================================================
 
-function buildRequestModal(type) {
+function openCaseModal(interaction, typeKey) {
+  const type = CASE_TYPES[typeKey];
+
+  if (!type) {
+    return interaction.reply({
+      content: "Tipo de solicitação inválido.",
+      ephemeral: true
+    });
+  }
+
+  if (typeKey === "acompanhamento") {
+    const modal = new ModalBuilder()
+      .setCustomId("sicor:consultar")
+      .setTitle("Acompanhar processo");
+
+    const protocolInput = new TextInputBuilder()
+      .setCustomId("protocol")
+      .setLabel("Número do protocolo SICOR")
+      .setPlaceholder("Ex.: SICOR-2026-0001")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(30);
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(protocolInput)
+    );
+
+    return interaction.showModal(modal);
+  }
+
   const modal = new ModalBuilder()
-    .setCustomId(`sicor:submit:${type}`)
-    .setTitle(`SICOR | ${type}`.slice(0, 45));
+    .setCustomId(`sicor:form:${typeKey}`)
+    .setTitle(type);
 
-  const subject = new TextInputBuilder()
+  const subjectInput = new TextInputBuilder()
     .setCustomId("subject")
-    .setLabel("Assunto")
+    .setLabel("Assunto da solicitação")
+    .setPlaceholder("Informe o assunto principal.")
     .setStyle(TextInputStyle.Short)
-    .setPlaceholder("Resuma o motivo da solicitação")
-    .setMaxLength(100)
-    .setRequired(true);
+    .setRequired(true)
+    .setMaxLength(100);
 
-  const description = new TextInputBuilder()
+  const involvedInput = new TextInputBuilder()
+    .setCustomId("involved")
+    .setLabel("Policial ou pessoa envolvida")
+    .setPlaceholder("Informe o nome ou ID, se aplicável.")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(100);
+
+  const descriptionInput = new TextInputBuilder()
     .setCustomId("description")
-    .setLabel("Descrição detalhada")
+    .setLabel("Relato detalhado")
+    .setPlaceholder("Descreva os fatos com clareza e objetividade.")
     .setStyle(TextInputStyle.Paragraph)
-    .setPlaceholder("Relate os fatos de forma clara e objetiva")
-    .setMaxLength(1000)
-    .setRequired(true);
+    .setRequired(true)
+    .setMaxLength(1800);
 
-  const unit = new TextInputBuilder()
-    .setCustomId("unit")
-    .setLabel("Unidade/Corporação (opcional)")
-    .setStyle(TextInputStyle.Short)
-    .setPlaceholder("Nome ou identificação da unidade")
-    .setMaxLength(100)
-    .setRequired(false);
-
-  const occurredAt = new TextInputBuilder()
-    .setCustomId("occurred_at")
-    .setLabel("Data/horário do ocorrido (opcional)")
-    .setStyle(TextInputStyle.Short)
-    .setPlaceholder("Ex.: 17/10/2026, por volta das 14h")
-    .setMaxLength(100)
-    .setRequired(false);
-
-  const evidence = new TextInputBuilder()
+  const evidenceInput = new TextInputBuilder()
     .setCustomId("evidence")
-    .setLabel("Evidências/links (opcional)")
+    .setLabel("Links de evidências (opcional)")
+    .setPlaceholder("Cole links de imagens, vídeos ou documentos.")
     .setStyle(TextInputStyle.Paragraph)
-    .setPlaceholder("Cole links ou descreva as evidências")
-    .setMaxLength(1000)
-    .setRequired(false);
+    .setRequired(false)
+    .setMaxLength(1000);
 
   modal.addComponents(
-    new ActionRowBuilder().addComponents(subject),
-    new ActionRowBuilder().addComponents(description),
-    new ActionRowBuilder().addComponents(unit),
-    new ActionRowBuilder().addComponents(occurredAt),
-    new ActionRowBuilder().addComponents(evidence)
+    new ActionRowBuilder().addComponents(subjectInput),
+    new ActionRowBuilder().addComponents(involvedInput),
+    new ActionRowBuilder().addComponents(descriptionInput),
+    new ActionRowBuilder().addComponents(evidenceInput)
   );
 
-  return modal;
+  return interaction.showModal(modal);
 }
 
-function buildDecisionModal(protocol) {
-  const input = new TextInputBuilder()
-    .setCustomId("decision")
-    .setLabel("Despacho/decisão")
+function openDispatchModal(interaction, caseId) {
+  const modal = new ModalBuilder()
+    .setCustomId(`sicor:despacho-form:${caseId}`)
+    .setTitle("Registrar despacho");
+
+  const dispatchInput = new TextInputBuilder()
+    .setCustomId("dispatch")
+    .setLabel("Despacho ou observação oficial")
+    .setPlaceholder("Registre a decisão ou providência adotada.")
     .setStyle(TextInputStyle.Paragraph)
-    .setMaxLength(1000)
     .setRequired(true)
-    .setPlaceholder("Registre a decisão ou observação oficial.");
+    .setMaxLength(1800);
 
-  return new ModalBuilder()
-    .setCustomId(`sicor:modal:decision:${protocol}`)
-    .setTitle("SICOR | Registrar despacho")
-    .addComponents(
-      new ActionRowBuilder().addComponents(input)
-    );
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(dispatchInput)
+  );
+
+  return interaction.showModal(modal);
 }
 
-function buildEvidenceModal(protocol) {
-  const input = new TextInputBuilder()
+function openEvidenceModal(interaction, caseId) {
+  const modal = new ModalBuilder()
+    .setCustomId(`sicor:evidencias-form:${caseId}`)
+    .setTitle("Adicionar evidências");
+
+  const evidenceInput = new TextInputBuilder()
     .setCustomId("evidence")
-    .setLabel("Nova evidência")
+    .setLabel("Links e informações das evidências")
+    .setPlaceholder("Cole os links e descreva o material apresentado.")
     .setStyle(TextInputStyle.Paragraph)
-    .setMaxLength(1000)
     .setRequired(true)
-    .setPlaceholder("Cole um link ou descreva a evidência.");
+    .setMaxLength(1800);
 
-  return new ModalBuilder()
-    .setCustomId(`sicor:modal:evidence:${protocol}`)
-    .setTitle("SICOR | Adicionar evidência")
-    .addComponents(
-      new ActionRowBuilder().addComponents(input)
-    );
-}
-
-function buildTrackModal() {
-  const input = new TextInputBuilder()
-    .setCustomId("protocol")
-    .setLabel("Número do protocolo")
-    .setStyle(TextInputStyle.Short)
-    .setMaxLength(30)
-    .setRequired(true)
-    .setPlaceholder("Ex.: SICOR-2026-0001");
-
-  return new ModalBuilder()
-    .setCustomId("sicor:modal:track")
-    .setTitle("SICOR | Acompanhar processo")
-    .addComponents(
-      new ActionRowBuilder().addComponents(input)
-    );
-}
-
-function buildStatusMenu(protocol) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(`sicor:statuspick:${protocol}`)
-      .setPlaceholder("Selecione o novo status")
-      .addOptions(STATUS_OPTIONS)
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(evidenceInput)
   );
+
+  return interaction.showModal(modal);
 }
 
 // ==================================================
@@ -543,32 +576,30 @@ function buildStatusMenu(protocol) {
 const commands = [
   new SlashCommandBuilder()
     .setName("sicor-ajuda")
-    .setDescription("Exibe os comandos do SICOR."),
+    .setDescription("Exibe as informações de utilização do SICOR."),
 
   new SlashCommandBuilder()
     .setName("sicor-publicar-painel")
-    .setDescription("Publica o painel de atendimento do SICOR.")
-    .setDefaultMemberPermissions(
-      PermissionFlagsBits.ManageGuild
-    ),
+    .setDescription("Publica o painel de atendimento da Corregedoria.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("sicor-processo")
-    .setDescription("Consulta um processo SICOR.")
+    .setDescription("Consulta um processo pelo protocolo.")
     .addStringOption((option) =>
       option
         .setName("protocolo")
-        .setDescription("Protocolo do processo")
+        .setDescription("Número do protocolo SICOR.")
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName("sicor-meus-processos")
-    .setDescription("Lista seus processos registrados."),
+    .setDescription("Consulta os processos registrados por você."),
 
   new SlashCommandBuilder()
     .setName("sicor-relatorio")
-    .setDescription("Exibe o relatório interno do SICOR."),
+    .setDescription("Exibe um relatório geral dos processos SICOR."),
 
   new SlashCommandBuilder()
     .setName("sicor-historico")
@@ -576,790 +607,676 @@ const commands = [
     .addStringOption((option) =>
       option
         .setName("protocolo")
-        .setDescription("Protocolo do processo")
+        .setDescription("Número do protocolo SICOR.")
         .setRequired(true)
-    ),
+    )
 ].map((command) => command.toJSON());
 
 // ==================================================
-// INICIALIZAÇÃO E CANAL INTERNO
+// REGISTRO DE COMANDOS
 // ==================================================
 
 async function registerCommands() {
-  const rest = new REST({ version: "10" })
-    .setToken(DISCORD_TOKEN);
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
   await rest.put(
     Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
     { body: commands }
   );
 
-  console.log("[SICOR] Comandos registrados.");
+  console.log("[SICOR] Comandos registrados no servidor do Reduto.");
 }
 
-async function fetchInternalChannel(guild) {
-  if (!guild) {
-    throw new Error("A ação precisa ser executada no servidor.");
-  }
+// ==================================================
+// NOTIFICAÇÃO INTERNA
+// ==================================================
 
-  const channel = await guild.channels.fetch(
-    INTERNAL_CHANNEL_ID
-  );
-
-  if (!channel || !channel.isTextBased() || !channel.send) {
-    throw new Error(
-      "Canal interno inválido. Confira INTERNAL_CHANNEL_ID."
-    );
-  }
-
-  return channel;
-}
-
-async function sendCaseToStaff(guild, record) {
-  const channel = await fetchInternalChannel(guild);
-
-  const message = await channel.send({
-    content:
-      `<@&${CORREGEDOR_ROLE_ID}> ` +
-      `<@&${ALTO_COMANDO_ROLE_ID}>\n` +
-      `Novo processo recebido: **${record.protocol}**`,
-
-    embeds: [caseEmbed(record)],
-    components: [staffButtons(record.protocol)],
-
-    allowedMentions: {
-      roles: [
-        CORREGEDOR_ROLE_ID,
-        ALTO_COMANDO_ROLE_ID,
-      ],
-    },
-  });
-
-  db.prepare(`
-    UPDATE cases
-    SET internal_message_id = ?
-    WHERE protocol = ?
-  `).run(message.id, record.protocol);
-}
-
-async function refreshInternalCase(guild, record) {
-  if (!record?.internal_message_id) {
-    return;
-  }
-
-  const channel = await fetchInternalChannel(guild);
-
-  const message = await channel.messages
-    .fetch(record.internal_message_id)
+async function notifyStaff(record) {
+  const channel = await client.channels
+    .fetch(INTERNAL_CHANNEL_ID)
     .catch(() => null);
 
-  if (message) {
-    await message.edit({
+  if (!channel || !channel.isTextBased()) {
+    console.error("[SICOR] Canal interno não encontrado.");
+    return false;
+  }
+
+  await channel.send({
+    content:
+      "📥 **NOVO REGISTRO — CORREGEDORIA DA POLÍCIA CIVIL DO REDUTO**\n" +
+      `Equipe responsável: <@&${CORREGEDOR_ROLE_ID}> <@&${ALTO_COMANDO_ROLE_ID}>`,
+    embeds: [caseEmbed(record)],
+    components: staffComponents(record.id),
+    allowedMentions: {
+      roles: [CORREGEDOR_ROLE_ID, ALTO_COMANDO_ROLE_ID]
+    }
+  });
+
+  return true;
+}
+
+// ==================================================
+// COMANDOS
+// ==================================================
+
+async function handleSlashCommand(interaction) {
+  const command = interaction.commandName;
+
+  if (command === "sicor-ajuda") {
+    return interaction.reply({
+      embeds: [
+        makeEmbed(
+          "⚖️ SICOR | Central de ajuda",
+          "**POLÍCIA CIVIL | REDUTO ONLINE**\n\n" +
+          "`/sicor-ajuda` — Exibe esta mensagem.\n" +
+          "`/sicor-publicar-painel` — Publica o painel de atendimento.\n" +
+          "`/sicor-processo` — Consulta um processo pelo protocolo.\n" +
+          "`/sicor-meus-processos` — Consulta seus registros.\n" +
+          "`/sicor-relatorio` — Exibe o relatório geral.\n" +
+          "`/sicor-historico` — Consulta o histórico de um processo.\n\n" +
+          "Utilize o painel oficial para registrar solicitações."
+        )
+      ],
+      ephemeral: true
+    });
+  }
+
+  if (command === "sicor-publicar-painel") {
+    if (!staffOnly(interaction)) {
+      return interaction.reply({
+        content: "Você não possui autorização para publicar o painel.",
+        ephemeral: true
+      });
+    }
+
+    return interaction.reply({
+      embeds: [publicPanelEmbed()],
+      components: publicPanelButtons()
+    });
+  }
+
+  if (command === "sicor-processo") {
+    if (!staffOnly(interaction)) {
+      return interaction.reply({
+        content: "Você não possui autorização para consultar processos internos.",
+        ephemeral: true
+      });
+    }
+
+    const record = getCaseByProtocol(
+      interaction.options.getString("protocolo")
+    );
+
+    if (!record) {
+      return interaction.reply({
+        content: "Nenhum processo foi encontrado com esse protocolo.",
+        ephemeral: true
+      });
+    }
+
+    return interaction.reply({
       embeds: [caseEmbed(record)],
-      components: [staffButtons(record.protocol)],
-      allowedMentions: { parse: [] },
+      components: staffComponents(record.id),
+      ephemeral: true
+    });
+  }
+
+  if (command === "sicor-meus-processos") {
+    const records = db.prepare(`
+      SELECT protocol, type, subject, status, created_at
+      FROM cases
+      WHERE author_id = ?
+      ORDER BY id DESC
+      LIMIT 10
+    `).all(interaction.user.id);
+
+    if (!records.length) {
+      return interaction.reply({
+        content: "Você ainda não possui processos registrados no SICOR.",
+        ephemeral: true
+      });
+    }
+
+    const description = records.map((record) =>
+      `**${record.protocol}**\n` +
+      `Tipo: ${record.type}\n` +
+      `Assunto: ${clip(record.subject, 150)}\n` +
+      `Status: **${record.status}**\n` +
+      `Data: ${formatDate(record.created_at)}`
+    ).join("\n\n");
+
+    return interaction.reply({
+      embeds: [
+        makeEmbed("📂 SICOR | Meus processos", description, COLORS.white)
+      ],
+      ephemeral: true
+    });
+  }
+
+  if (command === "sicor-relatorio") {
+    if (!staffOnly(interaction)) {
+      return interaction.reply({
+        content: "Você não possui autorização para acessar relatórios internos.",
+        ephemeral: true
+      });
+    }
+
+    const statuses = db.prepare(`
+      SELECT status, COUNT(*) AS total
+      FROM cases
+      GROUP BY status
+    `).all();
+
+    const total = statuses.reduce((sum, item) => sum + item.total, 0);
+
+    const description = [
+      `**Total de processos:** ${total}`,
+      ...STATUSES.map((status) => {
+        const found = statuses.find((item) => item.status === status.value);
+        return `**${status.label}:** ${found ? found.total : 0}`;
+      })
+    ].join("\n");
+
+    return interaction.reply({
+      embeds: [
+        makeEmbed("📊 SICOR | Relatório da Corregedoria", description)
+      ],
+      ephemeral: true
+    });
+  }
+
+  if (command === "sicor-historico") {
+    if (!staffOnly(interaction)) {
+      return interaction.reply({
+        content: "Você não possui autorização para consultar o histórico interno.",
+        ephemeral: true
+      });
+    }
+
+    const record = getCaseByProtocol(
+      interaction.options.getString("protocolo")
+    );
+
+    if (!record) {
+      return interaction.reply({
+        content: "Nenhum processo foi encontrado com esse protocolo.",
+        ephemeral: true
+      });
+    }
+
+    const events = db.prepare(`
+      SELECT *
+      FROM events
+      WHERE case_id = ?
+      ORDER BY id DESC
+      LIMIT 10
+    `).all(record.id);
+
+    const description = events.length
+      ? events.map((event) =>
+          `**${event.action}**\n` +
+          `Responsável: <@${event.actor_id}>\n` +
+          `Data: ${formatDate(event.created_at)}\n` +
+          `${clip(event.details || "Sem detalhes.", 500)}`
+        ).join("\n\n")
+      : "Nenhuma movimentação foi registrada neste processo.";
+
+    return interaction.reply({
+      embeds: [
+        makeEmbed(`📜 Histórico | ${record.protocol}`, description)
+      ],
+      ephemeral: true
     });
   }
 }
 
-async function showHistory(interaction, protocol) {
-  const record = getCase.get(protocol);
+// ==================================================
+// BOTÕES
+// ==================================================
+
+async function handleButton(interaction) {
+  const id = interaction.customId;
+
+  if (id.startsWith("sicor:new:")) {
+    return openCaseModal(interaction, id.split(":")[2]);
+  }
+
+  if (!id.startsWith("sicor:")) return;
+
+  const parts = id.split(":");
+  const action = parts[1];
+  const caseId = Number(parts[2]);
+
+  if (!Number.isInteger(caseId) || caseId <= 0) {
+    return interaction.reply({
+      content: "Identificador de processo inválido.",
+      ephemeral: true
+    });
+  }
+
+  if (!staffOnly(interaction)) {
+    return interaction.reply({
+      content: "Acesso negado. Função exclusiva da equipe autorizada.",
+      ephemeral: true
+    });
+  }
+
+  const record = getCaseById(caseId);
 
   if (!record) {
     return interaction.reply({
-      content: "❌ Processo não encontrado.",
-      ephemeral: true,
+      content: "Este processo não foi encontrado.",
+      ephemeral: true
     });
   }
 
-  if (!canAccessCase(interaction, record)) {
+  if (action === "assumir") {
+    if (record.assigned_to && record.assigned_to !== interaction.user.id) {
+      return interaction.reply({
+        content: `Este processo já está sob responsabilidade de <@${record.assigned_to}>.`,
+        ephemeral: true
+      });
+    }
+
+    db.prepare(`
+      UPDATE cases
+      SET assigned_to = ?, updated_at = ?
+      WHERE id = ?
+    `).run(interaction.user.id, now(), caseId);
+
+    logEvent(
+      caseId,
+      interaction,
+      "Processo assumido",
+      `${interaction.user.tag} assumiu a responsabilidade.`
+    );
+
+    const updated = getCaseById(caseId);
+
+    return interaction.update({
+      embeds: [caseEmbed(updated)],
+      components: staffComponents(caseId)
+    });
+  }
+
+  if (action === "despacho") {
+    return openDispatchModal(interaction, caseId);
+  }
+
+  if (action === "evidencias") {
+    return openEvidenceModal(interaction, caseId);
+  }
+
+  if (action === "historico") {
+    const events = db.prepare(`
+      SELECT *
+      FROM events
+      WHERE case_id = ?
+      ORDER BY id DESC
+      LIMIT 10
+    `).all(caseId);
+
+    const description = events.length
+      ? events.map((event) =>
+          `**${event.action}**\n` +
+          `Responsável: <@${event.actor_id}>\n` +
+          `Data: ${formatDate(event.created_at)}\n` +
+          `${clip(event.details || "Sem detalhes.", 400)}`
+        ).join("\n\n")
+      : "Nenhuma movimentação registrada.";
+
     return interaction.reply({
-      content: "⛔ Você não tem autorização para consultar esse histórico.",
-      ephemeral: true,
+      embeds: [
+        makeEmbed(`📜 Histórico | ${record.protocol}`, description)
+      ],
+      ephemeral: true
+    });
+  }
+}
+
+// ==================================================
+// MENUS DE STATUS
+// ==================================================
+
+async function handleSelectMenu(interaction) {
+  if (!interaction.customId.startsWith("sicor:status:")) return;
+
+  if (!staffOnly(interaction)) {
+    return interaction.reply({
+      content: "Você não possui autorização para alterar o status.",
+      ephemeral: true
     });
   }
 
-  const events = getEvents.all(protocol);
+  const caseId = Number(interaction.customId.split(":")[2]);
+  const status = interaction.values[0];
 
-  const description = events.length
-    ? events.map((event) =>
-        `**${event.action}** — ${dateLabel(event.created_at)}\n` +
-        `Responsável: ${event.actor_tag}\n` +
-        (event.details ? `Detalhes: ${event.details}` : "")
-      ).join("\n\n").slice(0, 4000)
-    : "Nenhuma movimentação registrada.";
-
-  const embed = new EmbedBuilder()
-    .setColor(0xc9a227)
-    .setTitle(`📜 Histórico | ${protocol}`)
-    .setDescription(description)
-    .setFooter({
-      text: "SICOR • Histórico de movimentações",
+  if (!STATUSES.some((item) => item.value === status)) {
+    return interaction.reply({
+      content: "Status inválido.",
+      ephemeral: true
     });
+  }
 
-  return interaction.reply({
-    embeds: [embed],
-    ephemeral: true,
-    allowedMentions: { parse: [] },
+  const record = getCaseById(caseId);
+
+  if (!record) {
+    return interaction.reply({
+      content: "Processo não encontrado.",
+      ephemeral: true
+    });
+  }
+
+  updateCaseStatus(caseId, status, interaction);
+
+  return interaction.update({
+    embeds: [caseEmbed(getCaseById(caseId))],
+    components: staffComponents(caseId)
   });
 }
 
 // ==================================================
-// EVENTO READY
+// FORMULÁRIOS
+// ==================================================
+
+async function handleModal(interaction) {
+  const id = interaction.customId;
+
+  if (id === "sicor:consultar") {
+    const protocol = getText(interaction, "protocol").toUpperCase();
+    const record = getCaseByProtocol(protocol);
+
+    if (!record) {
+      return interaction.reply({
+        content: "Nenhum processo foi encontrado com esse protocolo.",
+        ephemeral: true
+      });
+    }
+
+    const isOwner = record.author_id === interaction.user.id;
+
+    if (!isOwner && !staffOnly(interaction)) {
+      return interaction.reply({
+        content: "Por segurança, somente o requerente ou a equipe autorizada pode consultar este processo.",
+        ephemeral: true
+      });
+    }
+
+    return interaction.reply({
+      embeds: [
+        makeEmbed(
+          "🔎 SICOR | Consulta de processo",
+          `**Protocolo:** ${record.protocol}\n` +
+          `**Tipo:** ${record.type}\n` +
+          `**Assunto:** ${clip(record.subject, 500)}\n` +
+          `**Status:** ${record.status}\n` +
+          `**Data de abertura:** ${formatDate(record.created_at)}`
+        )
+      ],
+      ephemeral: true
+    });
+  }
+
+  if (id.startsWith("sicor:form:")) {
+    const typeKey = id.split(":")[2];
+    const type = CASE_TYPES[typeKey];
+
+    if (!type) {
+      return interaction.reply({
+        content: "Tipo de solicitação inválido.",
+        ephemeral: true
+      });
+    }
+
+    const subject = getText(interaction, "subject");
+    const involved = getText(interaction, "involved") || "Não informado";
+    const description = getText(interaction, "description");
+    const evidence = getText(interaction, "evidence") || "";
+
+    if (!subject || !description) {
+      return interaction.reply({
+        content: "Preencha o assunto e o relato detalhado.",
+        ephemeral: true
+      });
+    }
+
+    const createdAt = now();
+    const protocol = createProtocol();
+
+    const result = db.prepare(`
+      INSERT INTO cases (
+        protocol,
+        type,
+        subject,
+        involved,
+        description,
+        evidence,
+        author_id,
+        author_tag,
+        status,
+        assigned_to,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      protocol,
+      type,
+      subject,
+      involved,
+      description,
+      evidence,
+      interaction.user.id,
+      interaction.user.tag,
+      "Recebido",
+      null,
+      createdAt,
+      createdAt
+    );
+
+    const caseId = Number(result.lastInsertRowid);
+
+    logEvent(
+      caseId,
+      interaction,
+      "Processo registrado",
+      `Tipo: ${type}. Protocolo: ${protocol}.`
+    );
+
+    let notificationSent = false;
+
+    try {
+      notificationSent = await notifyStaff(getCaseById(caseId));
+    } catch (error) {
+      console.error("[SICOR] Falha ao notificar a equipe:", error);
+    }
+
+    const embed = makeEmbed(
+      "✅ Solicitação registrada",
+      `Seu registro foi realizado com sucesso.\n\n` +
+      `**Protocolo:** \`${protocol}\`\n` +
+      `**Tipo:** ${type}\n` +
+      `**Status:** Recebido\n\n` +
+      "Guarde o número do protocolo para consultar o andamento.\n" +
+      "A equipe responsável analisará as informações apresentadas.",
+      COLORS.green
+    );
+
+    if (!notificationSent) {
+      embed.addFields({
+        name: "Aviso",
+        value: "O registro foi salvo, mas a equipe não pôde ser notificada automaticamente. Informe o Alto-Comando."
+      });
+    }
+
+    return interaction.reply({
+      embeds: [embed],
+      ephemeral: true
+    });
+  }
+
+  if (id.startsWith("sicor:despacho-form:")) {
+    if (!staffOnly(interaction)) {
+      return interaction.reply({
+        content: "Acesso negado.",
+        ephemeral: true
+      });
+    }
+
+    const caseId = Number(id.split(":")[2]);
+    const record = getCaseById(caseId);
+
+    if (!record) {
+      return interaction.reply({
+        content: "Processo não encontrado.",
+        ephemeral: true
+      });
+    }
+
+    const dispatch = getText(interaction, "dispatch");
+
+    if (!dispatch) {
+      return interaction.reply({
+        content: "O despacho não pode estar vazio.",
+        ephemeral: true
+      });
+    }
+
+    logEvent(caseId, interaction, "Despacho registrado", dispatch);
+
+    db.prepare(`
+      UPDATE cases
+      SET updated_at = ?
+      WHERE id = ?
+    `).run(now(), caseId);
+
+    return interaction.reply({
+      embeds: [
+        makeEmbed(
+          "📑 Despacho registrado",
+          `**Processo:** ${record.protocol}\n\n${clip(dispatch, 3000)}`,
+          COLORS.green
+        )
+      ],
+      ephemeral: true
+    });
+  }
+
+  if (id.startsWith("sicor:evidencias-form:")) {
+    if (!staffOnly(interaction)) {
+      return interaction.reply({
+        content: "Acesso negado.",
+        ephemeral: true
+      });
+    }
+
+    const caseId = Number(id.split(":")[2]);
+    const record = getCaseById(caseId);
+
+    if (!record) {
+      return interaction.reply({
+        content: "Processo não encontrado.",
+        ephemeral: true
+      });
+    }
+
+    const evidence = getText(interaction, "evidence");
+
+    if (!evidence) {
+      return interaction.reply({
+        content: "Informe as evidências.",
+        ephemeral: true
+      });
+    }
+
+    const updatedEvidence = record.evidence
+      ? `${record.evidence}\n\n[${formatDate(now())}] ${interaction.user.tag}:\n${evidence}`
+      : `[${formatDate(now())}] ${interaction.user.tag}:\n${evidence}`;
+
+    db.prepare(`
+      UPDATE cases
+      SET evidence = ?, updated_at = ?
+      WHERE id = ?
+    `).run(clip(updatedEvidence, 5000), now(), caseId);
+
+    logEvent(caseId, interaction, "Evidências adicionadas", evidence);
+
+    return interaction.reply({
+      content: `Evidências adicionadas ao processo **${record.protocol}**.`,
+      ephemeral: true
+    });
+  }
+}
+
+// ==================================================
+// EVENTOS DO DISCORD
 // ==================================================
 
 client.once("ready", () => {
-  console.log(
-    `[SICOR] Bot conectado como ${client.user.tag}`
-  );
+  console.log("====================================");
+  console.log("[SICOR] Sistema iniciado.");
+  console.log(`[SICOR] Bot conectado como ${client.user.tag}`);
+  console.log("[SICOR] Organização: Polícia Civil do Reduto Online");
+  console.log(`[SICOR] Servidor configurado: ${GUILD_ID}`);
+  console.log("====================================");
 });
-
-// ==================================================
-// TRATAMENTO DE INTERAÇÕES
-// ==================================================
 
 client.on("interactionCreate", async (interaction) => {
   try {
-
-    // ----------------------------------------------
-    // COMANDOS SLASH
-    // ----------------------------------------------
-
     if (interaction.isChatInputCommand()) {
-
-      if (interaction.commandName === "sicor-ajuda") {
-        const embed = new EmbedBuilder()
-          .setColor(0xc9a227)
-          .setTitle("⚖️ SICOR — Central de Ajuda")
-          .setDescription(
-            "`/sicor-ajuda` — exibe esta ajuda.\n\n" +
-            "`/sicor-publicar-painel` — publica o painel.\n\n" +
-            "`/sicor-processo` — consulta um processo.\n\n" +
-            "`/sicor-meus-processos` — lista seus processos.\n\n" +
-            "`/sicor-historico` — consulta movimentações.\n\n" +
-            "`/sicor-relatorio` — relatório interno da equipe."
-          );
-
-        return interaction.reply({
-          embeds: [embed],
-          ephemeral: true,
-        });
-      }
-
-      if (
-        interaction.commandName ===
-        "sicor-publicar-painel"
-      ) {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({
-            content:
-              "⛔ Apenas Corregedores ou Alto-Comando podem publicar o painel.",
-            ephemeral: true,
-          });
-        }
-
-        return interaction.reply({
-          embeds: [publicPanelEmbed()],
-          components: publicPanelRows(),
-          allowedMentions: { parse: [] },
-        });
-      }
-
-      if (interaction.commandName === "sicor-processo") {
-        const protocol = interaction.options
-          .getString("protocolo", true)
-          .trim()
-          .toUpperCase();
-
-        const record = getCase.get(protocol);
-
-        if (!record) {
-          return interaction.reply({
-            content: "❌ Processo não encontrado.",
-            ephemeral: true,
-          });
-        }
-
-        if (!canAccessCase(interaction, record)) {
-          return interaction.reply({
-            content:
-              "⛔ Você não tem autorização para consultar esse processo.",
-            ephemeral: true,
-          });
-        }
-
-        return interaction.reply({
-          embeds: [caseEmbed(record)],
-          ephemeral: true,
-          allowedMentions: { parse: [] },
-        });
-      }
-
-      if (
-        interaction.commandName ===
-        "sicor-meus-processos"
-      ) {
-        const records = getUserCases.all(
-          interaction.user.id
-        );
-
-        if (!records.length) {
-          return interaction.reply({
-            content:
-              "Você ainda não possui processos registrados no SICOR.",
-            ephemeral: true,
-          });
-        }
-
-        const embed = new EmbedBuilder()
-          .setColor(0xc9a227)
-          .setTitle("📂 Meus processos")
-          .setDescription(
-            records.map((record) =>
-              `**${record.protocol}** — ${record.type}\n` +
-              `Status: **${record.status}**\n` +
-              `Assunto: ${record.subject}`
-            ).join("\n\n").slice(0, 4000)
-          );
-
-        return interaction.reply({
-          embeds: [embed],
-          ephemeral: true,
-        });
-      }
-
-      if (interaction.commandName === "sicor-relatorio") {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({
-            content:
-              "⛔ Apenas Corregedores ou Alto-Comando podem consultar o relatório.",
-            ephemeral: true,
-          });
-        }
-
-        const total = db.prepare(`
-          SELECT COUNT(*) AS total FROM cases
-        `).get().total;
-
-        const counts = db.prepare(`
-          SELECT status, COUNT(*) AS total
-          FROM cases
-          GROUP BY status
-        `).all();
-
-        const records = getRecentCases.all();
-
-        const embed = new EmbedBuilder()
-          .setColor(0xc9a227)
-          .setTitle("📊 Relatório SICOR")
-          .setDescription(
-            `**Total de processos:** ${total}\n\n` +
-            (
-              counts.map((item) =>
-                `**${item.status}:** ${item.total}`
-              ).join("\n") ||
-              "Nenhum processo registrado."
-            )
-          )
-          .addFields({
-            name: "Processos recentes",
-            value: records.length
-              ? records.map((record) =>
-                  `**${record.protocol}** — ${record.status} — ${record.subject}`
-                ).join("\n").slice(0, 1024)
-              : "Nenhum processo registrado.",
-          });
-
-        return interaction.reply({
-          embeds: [embed],
-          ephemeral: true,
-        });
-      }
-
-      if (interaction.commandName === "sicor-historico") {
-        const protocol = interaction.options
-          .getString("protocolo", true)
-          .trim()
-          .toUpperCase();
-
-        return showHistory(interaction, protocol);
-      }
+      await handleSlashCommand(interaction);
+    } else if (interaction.isButton()) {
+      await handleButton(interaction);
+    } else if (interaction.isStringSelectMenu()) {
+      await handleSelectMenu(interaction);
+    } else if (interaction.isModalSubmit()) {
+      await handleModal(interaction);
     }
-
-    // ----------------------------------------------
-    // BOTÕES
-    // ----------------------------------------------
-
-    if (interaction.isButton()) {
-      const id = interaction.customId;
-
-      if (id.startsWith("sicor:new:")) {
-        const type = id.slice("sicor:new:".length);
-
-        return interaction.showModal(
-          buildRequestModal(type)
-        );
-      }
-
-      if (id === "sicor:track") {
-        return interaction.showModal(
-          buildTrackModal()
-        );
-      }
-
-      if (id.startsWith("sicor:staff:")) {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({
-            content:
-              "⛔ Acesso restrito à equipe da Corregedoria.",
-            ephemeral: true,
-          });
-        }
-
-        const [, , action, protocol] = id.split(":");
-        const record = getCase.get(protocol);
-
-        if (!record) {
-          return interaction.reply({
-            content: "❌ Processo não encontrado.",
-            ephemeral: true,
-          });
-        }
-
-        if (action === "status") {
-          return interaction.reply({
-            content:
-              `Selecione o novo status do processo **${protocol}**:`,
-            components: [buildStatusMenu(protocol)],
-            ephemeral: true,
-          });
-        }
-
-        if (action === "decision") {
-          return interaction.showModal(
-            buildDecisionModal(protocol)
-          );
-        }
-
-        if (action === "evidence") {
-          return interaction.showModal(
-            buildEvidenceModal(protocol)
-          );
-        }
-
-        if (action === "assign") {
-          updateAssignee.run(
-            interaction.user.id,
-            nowIso(),
-            protocol
-          );
-
-          addEvent(
-            protocol,
-            interaction.user,
-            "Processo assumido",
-            `Responsável: ${interaction.user.tag}`
-          );
-
-          const updated = getCase.get(protocol);
-
-          await interaction.reply({
-            content:
-              `✅ Você assumiu o processo **${protocol}**.`,
-            ephemeral: true,
-          });
-
-          await refreshInternalCase(
-            interaction.guild,
-            updated
-          );
-
-          return;
-        }
-
-        if (action === "history") {
-          return showHistory(interaction, protocol);
-        }
-      }
-    }
-
-    // ----------------------------------------------
-    // MENU DE STATUS
-    // ----------------------------------------------
-
-    if (
-      interaction.isStringSelectMenu() &&
-      interaction.customId.startsWith("sicor:statuspick:")
-    ) {
-      if (!hasStaffRole(interaction.member)) {
-        return interaction.reply({
-          content:
-            "⛔ Acesso restrito à equipe da Corregedoria.",
-          ephemeral: true,
-        });
-      }
-
-      const protocol = interaction.customId.slice(
-        "sicor:statuspick:".length
-      );
-
-      const status = interaction.values[0];
-
-      if (
-        !STATUS_OPTIONS.some(
-          (option) => option.value === status
-        )
-      ) {
-        return interaction.reply({
-          content: "Status inválido.",
-          ephemeral: true,
-        });
-      }
-
-      const record = getCase.get(protocol);
-
-      if (!record) {
-        return interaction.update({
-          content: "❌ Processo não encontrado.",
-          components: [],
-        });
-      }
-
-      updateStatus.run(status, nowIso(), protocol);
-
-      addEvent(
-        protocol,
-        interaction.user,
-        "Status alterado",
-        `Novo status: ${status}`
-      );
-
-      const updated = getCase.get(protocol);
-
-      await interaction.update({
-        content:
-          `✅ Status de **${protocol}** alterado para **${status}**.`,
-        components: [],
-      });
-
-      await refreshInternalCase(
-        interaction.guild,
-        updated
-      );
-
-      return;
-    }
-
-    // ----------------------------------------------
-    // FORMULÁRIOS ENVIADOS
-    // ----------------------------------------------
-
-    if (interaction.isModalSubmit()) {
-
-      // NOVA SOLICITAÇÃO
-      if (
-        interaction.customId.startsWith(
-          "sicor:submit:"
-        )
-      ) {
-        const type = interaction.customId.slice(
-          "sicor:submit:".length
-        );
-
-        const subject = interaction.fields
-          .getTextInputValue("subject")
-          .trim();
-
-        const description = interaction.fields
-          .getTextInputValue("description")
-          .trim();
-
-        // Campos opcionais tratados sem causar erro
-        const unit = interaction.fields.fields.has("unit")
-          ? interaction.fields.getTextInputValue("unit").trim()
-          : "";
-
-        const occurredAt = interaction.fields.fields.has("occurred_at")
-          ? interaction.fields.getTextInputValue("occurred_at").trim()
-          : "";
-
-        const evidence = interaction.fields.fields.has("evidence")
-          ? interaction.fields.getTextInputValue("evidence").trim()
-          : "";
-
-        const timestamp = nowIso();
-
-        // Primeiro insere com protocolo temporário
-        const result = db.prepare(`
-          INSERT INTO cases (
-            protocol,
-            type,
-            requester_id,
-            requester_tag,
-            subject,
-            description,
-            unit,
-            occurred_at,
-            evidence,
-            status,
-            created_at,
-            updated_at
-          )
-          VALUES (
-            'PENDING',
-            ?, ?, ?, ?, ?, ?, ?, ?,
-            'Recebido',
-            ?, ?
-          )
-        `).run(
-          type,
-          interaction.user.id,
-          interaction.user.tag ?? interaction.user.username,
-          subject,
-          description,
-          unit,
-          occurredAt,
-          evidence,
-          timestamp,
-          timestamp
-        );
-
-        const protocol =
-          `SICOR-${new Date().getFullYear()}-` +
-          String(result.lastInsertRowid).padStart(4, "0");
-
-        db.prepare(`
-          UPDATE cases
-          SET protocol = ?
-          WHERE id = ?
-        `).run(protocol, result.lastInsertRowid);
-
-        addEvent(
-          protocol,
-          interaction.user,
-          "Processo criado",
-          `Tipo: ${type}`
-        );
-
-        const record = getCase.get(protocol);
-
-        await interaction.reply({
-          content:
-            "✅ Sua solicitação foi registrada!\n\n" +
-            `**Protocolo:** \`${protocol}\`\n\n` +
-            "Guarde esse número para acompanhar seu processo.",
-          ephemeral: true,
-        });
-
-        try {
-          await sendCaseToStaff(
-            interaction.guild,
-            record
-          );
-        } catch (error) {
-          console.error(
-            "[SICOR] Erro ao notificar a equipe:",
-            error
-          );
-
-          await interaction.followUp({
-            content:
-              "⚠️ Seu protocolo foi salvo, mas não consegui notificar a equipe. Avise um administrador.",
-            ephemeral: true,
-          }).catch(() => {});
-        }
-
-        return;
-      }
-
-      // ACOMPANHAR PROCESSO
-      if (
-        interaction.customId === "sicor:modal:track"
-      ) {
-        const protocol = interaction.fields
-          .getTextInputValue("protocol")
-          .trim()
-          .toUpperCase();
-
-        const record = getCase.get(protocol);
-
-        if (!record) {
-          return interaction.reply({
-            content:
-              "❌ Protocolo não encontrado. Confira o número e tente novamente.",
-            ephemeral: true,
-          });
-        }
-
-        if (!canAccessCase(interaction, record)) {
-          return interaction.reply({
-            content:
-              "⛔ Somente o solicitante e a equipe autorizada podem consultar esse processo.",
-            ephemeral: true,
-          });
-        }
-
-        return interaction.reply({
-          embeds: [caseEmbed(record)],
-          ephemeral: true,
-          allowedMentions: { parse: [] },
-        });
-      }
-
-      // REGISTRAR DESPACHO
-      if (
-        interaction.customId.startsWith(
-          "sicor:modal:decision:"
-        )
-      ) {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({
-            content: "⛔ Acesso restrito à equipe.",
-            ephemeral: true,
-          });
-        }
-
-        const protocol = interaction.customId.slice(
-          "sicor:modal:decision:".length
-        );
-
-        const decision = interaction.fields
-          .getTextInputValue("decision")
-          .trim();
-
-        const record = getCase.get(protocol);
-
-        if (!record) {
-          return interaction.reply({
-            content: "❌ Processo não encontrado.",
-            ephemeral: true,
-          });
-        }
-
-        updateDecision.run(
-          decision,
-          nowIso(),
-          protocol
-        );
-
-        addEvent(
-          protocol,
-          interaction.user,
-          "Despacho registrado",
-          decision
-        );
-
-        await interaction.reply({
-          content:
-            `✅ Despacho registrado no processo **${protocol}**.`,
-          ephemeral: true,
-        });
-
-        await refreshInternalCase(
-          interaction.guild,
-          getCase.get(protocol)
-        );
-
-        return;
-      }
-
-      // ADICIONAR EVIDÊNCIA
-      if (
-        interaction.customId.startsWith(
-          "sicor:modal:evidence:"
-        )
-      ) {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({
-            content: "⛔ Acesso restrito à equipe.",
-            ephemeral: true,
-          });
-        }
-
-        const protocol = interaction.customId.slice(
-          "sicor:modal:evidence:".length
-        );
-
-        const newEvidence = interaction.fields
-          .getTextInputValue("evidence")
-          .trim();
-
-        const record = getCase.get(protocol);
-
-        if (!record) {
-          return interaction.reply({
-            content: "❌ Processo não encontrado.",
-            ephemeral: true,
-          });
-        }
-
-        const combined = [
-          record.evidence,
-          newEvidence,
-        ].filter(Boolean).join("\n\n");
-
-        updateEvidence.run(
-          combined.slice(0, 1000),
-          nowIso(),
-          protocol
-        );
-
-        addEvent(
-          protocol,
-          interaction.user,
-          "Evidência adicionada",
-          newEvidence
-        );
-
-        await interaction.reply({
-          content:
-            `✅ Evidência adicionada ao processo **${protocol}**.`,
-          ephemeral: true,
-        });
-
-        await refreshInternalCase(
-          interaction.guild,
-          getCase.get(protocol)
-        );
-
-        return;
-      }
-    }
-
   } catch (error) {
-    console.error(
-      "[SICOR] Erro ao processar interação:",
-      error
-    );
+    console.error("[SICOR] Erro ao processar interação:", error);
 
-    if (
-      interaction.isRepliable() &&
-      !interaction.replied &&
-      !interaction.deferred
-    ) {
-      await interaction.reply({
-        content:
-          "❌ Ocorreu um erro ao processar essa ação. Confira as configurações do bot e tente novamente.",
-        ephemeral: true,
-      }).catch(() => {});
+    const message =
+      "Ocorreu um erro ao processar sua solicitação. Tente novamente ou contate o Alto-Comando.";
+
+    try {
+      if (interaction.deferred) {
+        await interaction.editReply({
+          content: message,
+          embeds: [],
+          components: []
+        });
+      } else if (interaction.replied) {
+        await interaction.followUp({
+          content: message,
+          ephemeral: true
+        });
+      } else {
+        await interaction.reply({
+          content: message,
+          ephemeral: true
+        });
+      }
+    } catch (replyError) {
+      console.error("[SICOR] Não foi possível enviar a mensagem de erro:", replyError);
     }
   }
 });
 
 // ==================================================
-// INICIAR BOT
+// INICIALIZAÇÃO
 // ==================================================
 
-(async () => {
+async function start() {
   try {
     await registerCommands();
     await client.login(DISCORD_TOKEN);
   } catch (error) {
-    console.error(
-      "[SICOR] Falha ao iniciar o bot:",
-      error
-    );
-
+    console.error("[SICOR] Não foi possível iniciar o sistema:", error);
     process.exit(1);
   }
-})();
+}
+
+process.on("unhandledRejection", (error) => {
+  console.error("[SICOR] Erro não tratado:", error);
+});
+
+start();
