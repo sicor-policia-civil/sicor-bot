@@ -1,0 +1,17 @@
+{
+  "name": "sicor-discord-bot",
+  "version": "1.0.0",
+  "description": "SICOR - Sistema Integrado de Corregedoria para Discord",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "discord.js": "^14.22.1",
+    "better-sqlite3": "^12.2.0",
+    "dotenv": "^16.6.1"
+  }
+}
